@@ -12,6 +12,8 @@
 #include "AudioOutputDevice.h"
 #include "VideoDecoder.h"
 
+class PreviewFrameLoader;
+
 class PlaybackController : public QObject
 {
     Q_OBJECT
@@ -75,6 +77,7 @@ private slots:
 
 private:
     VideoDecoder* m_decoder = nullptr;
+    PreviewFrameLoader* m_previewLoader = nullptr;
     QAudioSink* m_audioSink = nullptr;
     AudioOutputDevice* m_audioOutput = nullptr;
     QTimer* m_renderTimer = nullptr;

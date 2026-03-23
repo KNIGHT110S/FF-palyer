@@ -1,5 +1,7 @@
 #include "PlaybackController.h"
 
+#include "PreviewFrameLoader.h"
+
 #include <QAudioDevice>
 #include <QCoreApplication>
 #include <QDebug>
@@ -20,6 +22,7 @@ constexpr size_t kMaxRenderQueueSize = 90;
 PlaybackController::PlaybackController(QObject* parent)
     : QObject(parent)
     , m_decoder(new VideoDecoder(this))
+    , m_previewLoader(new PreviewFrameLoader(this))
     , m_renderTimer(new QTimer(this))
     , m_previewTimer(new QTimer(this))
 {
@@ -31,9 +34,6 @@ PlaybackController::PlaybackController(QObject* parent)
     connect(m_decoder, &VideoDecoder::videoImageReady,
             this, &PlaybackController::handleVideoImage,
             Qt::QueuedConnection);
-    connect(m_decoder, &VideoDecoder::previewImageReady,
-            this, &PlaybackController::handlePreviewImage,
-            Qt::QueuedConnection);
     connect(m_decoder, &VideoDecoder::audioFrameDecoded,
             this, &PlaybackController::handleAudioFrame,
             Qt::QueuedConnection);
@@ -41,6 +41,12 @@ PlaybackController::PlaybackController(QObject* parent)
             this, &PlaybackController::handleDecodeFinished,
             Qt::QueuedConnection);
     connect(m_decoder, &VideoDecoder::errorOccurred,
+            this, &PlaybackController::handleDecoderError,
+            Qt::QueuedConnection);
+    connect(m_previewLoader, &PreviewFrameLoader::previewImageReady,
+            this, &PlaybackController::handlePreviewImage,
+            Qt::QueuedConnection);
+    connect(m_previewLoader, &PreviewFrameLoader::errorOccurred,
             this, &PlaybackController::handleDecoderError,
             Qt::QueuedConnection);
 
@@ -70,7 +76,8 @@ bool PlaybackController::openMedia(const QString& path)
         m_previewTimer->stop();
     }
     m_pendingPreviewMs = -1;
-    m_decoder->cancelPendingPreview();
+    m_previewLoader->cancelPendingPreview();
+    m_previewLoader->close();
     m_decoder->stopDecoding();
     QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
 
@@ -86,10 +93,16 @@ bool PlaybackController::openMedia(const QString& path)
         return false;
     }
 
+    const bool previewAvailable = m_previewLoader->openMedia(path);
+    if (!previewAvailable) {
+        emit statusMessageChanged(
+            QStringLiteral("Opened video: %1 (preview channel unavailable)").arg(path));
+    }
+
     m_mediaLoaded = true;
     emit mediaLoadedChanged(true);
 
-    if (!m_decoder->loadPreviewFrame(0)) {
+    if (previewAvailable && !m_previewLoader->loadPreviewFrame(0)) {
         emit statusMessageChanged(
             QStringLiteral("Opened video: %1 (failed to load first-frame preview)").arg(path));
         emit overlayVisibilityChanged(true);
@@ -147,7 +160,7 @@ void PlaybackController::stop()
         m_previewTimer->stop();
     }
     m_pendingPreviewMs = -1;
-    m_decoder->cancelPendingPreview();
+    m_previewLoader->cancelPendingPreview();
     m_decoder->stopDecoding();
     QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
     clearRenderQueue();
@@ -182,7 +195,7 @@ void PlaybackController::beginSeek()
     if (m_previewTimer) {
         m_previewTimer->stop();
     }
-    m_decoder->cancelPendingPreview();
+    m_previewLoader->cancelPendingPreview();
     emit overlayVisibilityChanged(false);
 
     m_wasPlayingBeforeSeek = m_clockRunning;
@@ -214,7 +227,7 @@ void PlaybackController::endSeek(qint64 targetMs)
     if (m_previewTimer) {
         m_previewTimer->stop();
     }
-    m_decoder->cancelPendingPreview();
+    m_previewLoader->cancelPendingPreview();
 
     const qint64 boundedMs = targetMs < 0 ? 0 : targetMs;
     m_clockRunning = false;
@@ -242,7 +255,7 @@ void PlaybackController::endSeek(qint64 targetMs)
         return;
     }
 
-    m_decoder->requestPreviewFrame(boundedMs);
+    m_previewLoader->requestPreviewFrame(boundedMs);
     emit overlayVisibilityChanged(true);
     emit statusMessageChanged(QStringLiteral("Preview moved to %1 ms").arg(boundedMs));
 }
@@ -612,7 +625,7 @@ void PlaybackController::requestPendingPreview()
         return;
     }
 
-    m_decoder->requestPreviewFrame(m_pendingPreviewMs);
+    m_previewLoader->requestPreviewFrame(m_pendingPreviewMs);
 }
 
 void PlaybackController::handleDecodeFinished()

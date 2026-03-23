@@ -169,8 +169,6 @@ bool VideoDecoder::open(const QString& path)
 
 bool VideoDecoder::startDecoding()
 {
-    stopPreviewWorker();
-
     if (!fmtCtx || !videoCodecCtx || videoStreamIndex < 0) {
         emit errorOccurred(QStringLiteral("Decoder is not initialized. Cannot start decoding."));
         return false;
@@ -202,8 +200,6 @@ void VideoDecoder::stopDecoding()
 
 bool VideoDecoder::seekMs(qint64 targetMs)
 {
-    stopPreviewWorker();
-
     if (!fmtCtx || !videoCodecCtx || videoStreamIndex < 0) {
         emit errorOccurred(QStringLiteral("Decoder is not ready. Cannot perform seek."));
         return false;
@@ -235,50 +231,6 @@ bool VideoDecoder::seekMs(qint64 targetMs)
         emit errorOccurred(errorMessage);
     }
     return true;
-}
-
-bool VideoDecoder::loadPreviewFrame(qint64 targetMs)
-{
-    stopPreviewWorker();
-
-    QImage image;
-    qint64 ptsMs = targetMs;
-    if (!loadPreviewFrameInternal(targetMs, &image, &ptsMs)) {
-        return false;
-    }
-
-    emit previewImageReady(image, ptsMs);
-    return true;
-}
-
-void VideoDecoder::requestPreviewFrame(qint64 targetMs)
-{
-    if (!fmtCtx || !videoCodecCtx || videoStreamIndex < 0 || decoding.load()) {
-        return;
-    }
-
-    if (targetMs < 0) {
-        targetMs = 0;
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(previewMutex);
-        if (!previewThread.joinable()) {
-            previewStopRequested = false;
-            previewRequestPending = false;
-            previewRequestMs = -1;
-            previewThread = std::thread(&VideoDecoder::previewLoop, this);
-        }
-        previewRequestMs = targetMs;
-        previewRequestPending = true;
-        ++previewRequestSerial;
-    }
-    previewCv.notify_one();
-}
-
-void VideoDecoder::cancelPendingPreview()
-{
-    stopPreviewWorker();
 }
 
 void VideoDecoder::setPlaybackSpeed(double speed)
@@ -314,7 +266,6 @@ bool VideoDecoder::setAudioOutputFormat(const QAudioFormat& format)
 
 void VideoDecoder::close()
 {
-    stopPreviewWorker();
     audioChainValid.store(false);
     stopDecoding();
     m_videoFrameConverter.reset();
@@ -336,165 +287,6 @@ void VideoDecoder::close()
     }
     videoStreamIndex = -1;
     audioStreamIndex = -1;
-}
-
-bool VideoDecoder::loadPreviewFrameInternal(qint64 targetMs, QImage* outImage, qint64* outPtsMs)
-{
-    if (!fmtCtx || !videoCodecCtx || videoStreamIndex < 0 || !outImage || !outPtsMs) {
-        emit errorOccurred(QStringLiteral("Decoder is not ready. Cannot load preview frame."));
-        return false;
-    }
-
-    if (targetMs < 0) {
-        targetMs = 0;
-    }
-    m_decodePacer.setSeekFloor(targetMs);
-    stopDecoding();
-
-    AVStream* stream = fmtCtx->streams[videoStreamIndex];
-    const int64_t targetPts = av_rescale_q(targetMs, AVRational{1, 1000}, stream->time_base);
-    int ret = av_seek_frame(fmtCtx, videoStreamIndex, targetPts, AVSEEK_FLAG_BACKWARD);
-    if (ret < 0) {
-        emit errorOccurred(QStringLiteral("Preview seek failed: %1").arg(ffErr2Str(ret)));
-        return false;
-    }
-    avcodec_flush_buffers(videoCodecCtx);
-
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-    if (!packet || !frame) {
-        if (packet) {
-            av_packet_free(&packet);
-        }
-        if (frame) {
-            av_frame_free(&frame);
-        }
-        emit errorOccurred(QStringLiteral("Failed to allocate preview buffers."));
-        return false;
-    }
-
-    videoCodecCtx->skip_frame = AVDISCARD_NONREF;
-    videoCodecCtx->skip_loop_filter = AVDISCARD_ALL;
-    videoCodecCtx->skip_idct = AVDISCARD_ALL;
-
-    bool previewReady = false;
-    int maxPackets = 60;
-
-    while (!previewReady && maxPackets-- > 0 && (ret = av_read_frame(fmtCtx, packet)) >= 0) {
-        if (packet->stream_index != videoStreamIndex) {
-            av_packet_unref(packet);
-            continue;
-        }
-
-        ret = avcodec_send_packet(videoCodecCtx, packet);
-        av_packet_unref(packet);
-        if (ret < 0 && ret != AVERROR(EAGAIN)) {
-            emit errorOccurred(QStringLiteral("Failed to send preview packet: %1").arg(ffErr2Str(ret)));
-            break;
-        }
-
-        while (!previewReady) {
-            ret = avcodec_receive_frame(videoCodecCtx, frame);
-            if (ret == 0) {
-                const qint64 ptsMs = framePtsToMs(frame);
-                if (ptsMs < targetMs) {
-                    av_frame_unref(frame);
-                    continue;
-                }
-
-                if (m_videoFrameConverter.convert(frame, outImage)) {
-                    *outPtsMs = ptsMs;
-                    previewReady = true;
-                }
-                av_frame_unref(frame);
-                continue;
-            }
-            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-                break;
-            }
-            emit errorOccurred(QStringLiteral("Failed to read preview frame: %1").arg(ffErr2Str(ret)));
-            break;
-        }
-    }
-
-    videoCodecCtx->skip_frame = AVDISCARD_DEFAULT;
-    videoCodecCtx->skip_loop_filter = AVDISCARD_DEFAULT;
-    videoCodecCtx->skip_idct = AVDISCARD_DEFAULT;
-
-    av_frame_free(&frame);
-    av_packet_free(&packet);
-
-    const int resetRet = av_seek_frame(fmtCtx, videoStreamIndex, targetPts, AVSEEK_FLAG_BACKWARD);
-    if (resetRet >= 0) {
-        avcodec_flush_buffers(videoCodecCtx);
-        if (audioCodecCtx) {
-            avcodec_flush_buffers(audioCodecCtx);
-        }
-    }
-
-    seekTargetPtsMs.store(-1);
-    audioSpeedChanged.store(true);
-
-    return previewReady;
-}
-
-void VideoDecoder::previewLoop()
-{
-    while (true) {
-        qint64 targetMs = -1;
-        uint64_t requestSerial = 0;
-
-        {
-            std::unique_lock<std::mutex> lock(previewMutex);
-            previewCv.wait(lock, [this]() {
-                return previewStopRequested || previewRequestPending;
-            });
-            if (previewStopRequested) {
-                break;
-            }
-
-            targetMs = previewRequestMs;
-            requestSerial = previewRequestSerial;
-            previewRequestPending = false;
-        }
-
-        QImage image;
-        qint64 ptsMs = targetMs;
-        const bool success = loadPreviewFrameInternal(targetMs, &image, &ptsMs);
-
-        bool shouldEmit = false;
-        {
-            std::lock_guard<std::mutex> lock(previewMutex);
-            shouldEmit = success
-                         && !previewStopRequested
-                         && requestSerial == previewRequestSerial
-                         && !previewRequestPending;
-        }
-
-        if (shouldEmit) {
-            emit previewImageReady(image, ptsMs);
-        }
-    }
-}
-
-void VideoDecoder::stopPreviewWorker()
-{
-    {
-        std::lock_guard<std::mutex> lock(previewMutex);
-        previewStopRequested = true;
-        previewRequestPending = false;
-        previewRequestMs = -1;
-    }
-    previewCv.notify_all();
-
-    if (previewThread.joinable()) {
-        previewThread.join();
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(previewMutex);
-        previewStopRequested = false;
-    }
 }
 
 qint64 VideoDecoder::framePtsToMs(const AVFrame* frame) const
@@ -523,8 +315,11 @@ double VideoDecoder::framePtsToSec(const AVFrame* frame) const
     return av_q2d(stream->time_base) * pts;
 }
 
-void VideoDecoder::drainFrames(AVFrame* frame, bool* fatalError, bool* eofReached)
+void VideoDecoder::drainFrames(AVFrame* frame, bool* fatalError, bool* eofReached, bool* seekTargetReached)
 {
+    if (seekTargetReached) {
+        *seekTargetReached = false;
+    }
     if (!videoCodecCtx) {
         return;
     }
@@ -542,12 +337,12 @@ void VideoDecoder::drainFrames(AVFrame* frame, bool* fatalError, bool* eofReache
                     av_frame_unref(frame);
                     continue;
                 }
-                // Target reached, disable fast-forward
-                seekTargetPtsMs.store(-1);
+                if (seekTargetReached) {
+                    *seekTargetReached = true;
+                }
             }
 
             m_decodePacer.pace(ptsMs, abortDecode);
-            emit videoFrameDecoded(ptsMs, frame->width, frame->height);
 
             QImage image;
             if (m_videoFrameConverter.convert(frame, &image)) {
@@ -643,14 +438,43 @@ void VideoDecoder::decodeLoop()
 
     bool fatalError = false;
     bool eofReached = false;
+    bool videoSkipPolicyInitialized = false;
+    bool fastSeekDiscardEnabled = false;
     // Audio EOF separate tracking? For simplicity, we mostly care about video EOF for now or master clock.
     // But let's track both if we want perfect ending.
+
+    auto applyVideoSkipPolicy = [&](bool enableFastSeekDiscard) {
+        if (!videoCodecCtx) {
+            return;
+        }
+        if (videoSkipPolicyInitialized && fastSeekDiscardEnabled == enableFastSeekDiscard) {
+            return;
+        }
+
+        videoSkipPolicyInitialized = true;
+        fastSeekDiscardEnabled = enableFastSeekDiscard;
+        videoCodecCtx->skip_frame = enableFastSeekDiscard ? AVDISCARD_NONREF : AVDISCARD_DEFAULT;
+        videoCodecCtx->skip_loop_filter = enableFastSeekDiscard ? AVDISCARD_ALL : AVDISCARD_DEFAULT;
+        videoCodecCtx->skip_idct = enableFastSeekDiscard ? AVDISCARD_ALL : AVDISCARD_DEFAULT;
+    };
+
+    auto completePendingSeek = [&](bool seekTargetReached) {
+        if (!seekTargetReached) {
+            return;
+        }
+        seekTargetPtsMs.store(-1);
+        applyVideoSkipPolicy(false);
+    };
+
+    applyVideoSkipPolicy(seekTargetPtsMs.load() >= 0);
 
     auto sendVideoPacket = [&](AVPacket* pendingPacket) -> bool {
         while (!abortDecode.load()) {
             const int sendRet = avcodec_send_packet(videoCodecCtx, pendingPacket);
             if (sendRet == AVERROR(EAGAIN)) {
-                drainFrames(frame, &fatalError, &eofReached);
+                bool seekTargetReached = false;
+                drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+                completePendingSeek(seekTargetReached);
                 if (fatalError || eofReached || abortDecode.load()) {
                     return false;
                 }
@@ -687,26 +511,17 @@ void VideoDecoder::decodeLoop()
     };
 
     while (!abortDecode.load()) {
-        // Optimization: When seeking, configure decoder to skip non-reference frames and loop filtering
-        // ... (existing optimization code) ...
-        const qint64 seekTarget = seekTargetPtsMs.load();
-        if (seekTarget >= 0) {
-             // ... set skip options ...
-             videoCodecCtx->skip_frame = AVDISCARD_NONREF;
-             videoCodecCtx->skip_loop_filter = AVDISCARD_ALL;
-             videoCodecCtx->skip_idct = AVDISCARD_ALL;
-        } else {
-             videoCodecCtx->skip_frame = AVDISCARD_DEFAULT;
-             videoCodecCtx->skip_loop_filter = AVDISCARD_DEFAULT;
-             videoCodecCtx->skip_idct = AVDISCARD_DEFAULT;
-        }
+        const qint64 currentSeekTarget = seekTargetPtsMs.load();
+        applyVideoSkipPolicy(currentSeekTarget >= 0);
 
         int ret = av_read_frame(fmtCtx, packet);
         if (ret == AVERROR_EOF) {
             avcodec_send_packet(videoCodecCtx, nullptr);
             if (audioCodecCtx) avcodec_send_packet(audioCodecCtx, nullptr);
             
-            drainFrames(frame, &fatalError, &eofReached);
+            bool seekTargetReached = false;
+            drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+            completePendingSeek(seekTargetReached);
             if (audioCodecCtx) drainAudioFrames(frame, &fatalError, &eofReached);
             if (audioChainValid.load() && m_audioFrameProcessor.isReady()) {
                 std::vector<ProcessedAudioFrame> processedFrames;
@@ -738,7 +553,9 @@ void VideoDecoder::decodeLoop()
                 }
                 continue;
             }
-            drainFrames(frame, &fatalError, &eofReached);
+            bool seekTargetReached = false;
+            drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+            completePendingSeek(seekTargetReached);
         } 
         else if (audioStreamIndex >= 0 && packet->stream_index == audioStreamIndex && audioCodecCtx) {
             const bool sent = sendAudioPacket(packet);
@@ -761,6 +578,7 @@ void VideoDecoder::decodeLoop()
         }
     }
 
+    applyVideoSkipPolicy(false);
     av_frame_free(&frame);
     av_packet_free(&packet);
     decoding.store(false);

@@ -19,6 +19,8 @@ set(PROJECT_SOURCES
         mainwindow.ui
         PlaybackController.cpp
         PlaybackController.h
+        PreviewFrameLoader.cpp
+        PreviewFrameLoader.h
         AudioFrameProcessor.cpp
         AudioFrameProcessor.h
         DecodePacer.cpp
