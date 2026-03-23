@@ -1,0 +1,11 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="icons/app.png">播放器.png</file>
+        <file alias="icons/play.png">开始.png</file>
+        <file alias="icons/pause.png">暂停.png</file>
+        <file alias="icons/pause_alt.png">暂停2.png</file>
+        <file alias="icons/stop.png">停止播放.png</file>
+        <file alias="icons/pause_overlay_large.png">暂停(大号).png</file>
+        <file alias="icons/pause_overlay.png">暂停(中号).png</file>
+    </qresource>
+</RCC>

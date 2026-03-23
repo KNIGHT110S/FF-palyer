@@ -1,0 +1,16 @@
+build/
+cmake-build-*/
+out/
+bin/
+obj/
+*.user
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.log
+*.cache
+*.autosave
+.idea/
+.vscode/
+.vs/
