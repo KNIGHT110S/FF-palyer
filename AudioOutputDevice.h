@@ -12,7 +12,7 @@ class AudioOutputDevice : public QIODevice
 {
     Q_OBJECT
 public:
-    explicit AudioOutputDevice(const QAudioFormat& format, QObject* parent = nullptr);
+    explicit AudioOutputDevice(const QAudioFormat& format);
     ~AudioOutputDevice();
 
     void beginStop();

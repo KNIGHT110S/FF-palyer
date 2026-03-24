@@ -279,7 +279,7 @@ void PlaybackController::setPlaybackRate(double rate)
     resetRenderClockCorrection();
     if (m_audioSink && m_audioOutput) {
         m_audioSink->reset();
-        m_audioSink->start(m_audioOutput);
+        m_audioSink->start(m_audioOutput.get());
         if (!m_clockRunning) {
             m_audioSink->suspend();
         }
@@ -432,30 +432,25 @@ void PlaybackController::teardownAudioChain(bool immediate)
 {
     Q_UNUSED(immediate);
 
-    QAudioSink* sink = m_audioSink;
-    AudioOutputDevice* output = m_audioOutput;
-    const bool outputOwnedBySink = sink && output && output->parent() == sink;
-
-    m_audioSink = nullptr;
-    m_audioOutput = nullptr;
+    auto output = std::move(m_audioOutput);
+    auto sink = std::move(m_audioSink);
 
     if (output) {
         output->beginStop();
-        output->clear();
     }
     if (sink) {
         sink->stop();
         sink->reset();
     }
+    if (output) {
+        output->clear();
+    }
     if (output && output->isOpen()) {
         output->close();
     }
-    if (sink) {
-        delete sink;
-    }
-    if (!outputOwnedBySink && output) {
-        delete output;
-    }
+
+    sink.reset();
+    output.reset();
 }
 
 void PlaybackController::resetPlaybackState()
@@ -504,19 +499,22 @@ void PlaybackController::handleMediaInfo(const MediaInfo& info)
             return;
         }
 
-        m_audioSink = new QAudioSink(device, format, this);
-        m_audioOutput = new AudioOutputDevice(format, m_audioSink);
+        auto sink = std::make_unique<QAudioSink>(device, format);
+        auto output = std::make_unique<AudioOutputDevice>(format);
 
         const qint32 bufferSize = format.bytesForDuration(1000000);
         if (bufferSize > 0) {
-            m_audioSink->setBufferSize(bufferSize);
+            sink->setBufferSize(bufferSize);
         }
 
-        if (!m_audioOutput->open(QIODevice::ReadOnly)) {
+        if (!output->open(QIODevice::ReadOnly)) {
             qWarning() << "Failed to open AudioOutputDevice";
         }
-        m_audioSink->start(m_audioOutput);
-        m_audioSink->suspend();
+        sink->start(output.get());
+        sink->suspend();
+
+        m_audioSink = std::move(sink);
+        m_audioOutput = std::move(output);
     }
 
     emit durationChanged(info.durationMs);
@@ -563,8 +561,8 @@ void PlaybackController::handlePreviewImage(const QImage& image, qint64 ptsMs)
 
 void PlaybackController::handleAudioFrame(const std::vector<uint8_t>& pcmData, double ptsSec)
 {
-    AudioOutputDevice* audioOutput = m_audioOutput;
-    QAudioSink* audioSink = m_audioSink;
+    AudioOutputDevice* audioOutput = m_audioOutput.get();
+    QAudioSink* audioSink = m_audioSink.get();
     if (!audioOutput || !audioSink) {
         return;
     }

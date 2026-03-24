@@ -1,6 +1,7 @@
 ﻿#include "VideoDecoder.h"
 
 #include <QByteArray>
+#include <memory>
 #include <thread>
 
 VideoDecoder::VideoDecoder(QObject* parent)
@@ -421,16 +422,23 @@ void VideoDecoder::drainAudioFrames(AVFrame* frame, bool* fatalError, bool* eofR
 
 void VideoDecoder::decodeLoop()
 {
-    AVPacket* packet = av_packet_alloc();
-    AVFrame* frame = av_frame_alloc();
-
-    if (!packet || !frame) {
-        if (packet) {
+    struct AVPacketDeleter {
+        void operator()(AVPacket* packet) const
+        {
             av_packet_free(&packet);
         }
-        if (frame) {
+    };
+    struct AVFrameDeleter {
+        void operator()(AVFrame* frame) const
+        {
             av_frame_free(&frame);
         }
+    };
+
+    std::unique_ptr<AVPacket, AVPacketDeleter> packet(av_packet_alloc());
+    std::unique_ptr<AVFrame, AVFrameDeleter> frame(av_frame_alloc());
+
+    if (!packet || !frame) {
         emit errorOccurred(QStringLiteral("Failed to allocate decoder buffers."));
         decoding.store(false);
         return;
@@ -473,7 +481,7 @@ void VideoDecoder::decodeLoop()
             const int sendRet = avcodec_send_packet(videoCodecCtx, pendingPacket);
             if (sendRet == AVERROR(EAGAIN)) {
                 bool seekTargetReached = false;
-                drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+                drainFrames(frame.get(), &fatalError, &eofReached, &seekTargetReached);
                 completePendingSeek(seekTargetReached);
                 if (fatalError || eofReached || abortDecode.load()) {
                     return false;
@@ -494,7 +502,7 @@ void VideoDecoder::decodeLoop()
         while (!abortDecode.load()) {
             const int sendRet = avcodec_send_packet(audioCodecCtx, pendingPacket);
             if (sendRet == AVERROR(EAGAIN)) {
-                drainAudioFrames(frame, &fatalError, &eofReached);
+                drainAudioFrames(frame.get(), &fatalError, &eofReached);
                 if (fatalError || eofReached || abortDecode.load()) {
                     return false;
                 }
@@ -514,15 +522,15 @@ void VideoDecoder::decodeLoop()
         const qint64 currentSeekTarget = seekTargetPtsMs.load();
         applyVideoSkipPolicy(currentSeekTarget >= 0);
 
-        int ret = av_read_frame(fmtCtx, packet);
+        int ret = av_read_frame(fmtCtx, packet.get());
         if (ret == AVERROR_EOF) {
             avcodec_send_packet(videoCodecCtx, nullptr);
             if (audioCodecCtx) avcodec_send_packet(audioCodecCtx, nullptr);
             
             bool seekTargetReached = false;
-            drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+            drainFrames(frame.get(), &fatalError, &eofReached, &seekTargetReached);
             completePendingSeek(seekTargetReached);
-            if (audioCodecCtx) drainAudioFrames(frame, &fatalError, &eofReached);
+            if (audioCodecCtx) drainAudioFrames(frame.get(), &fatalError, &eofReached);
             if (audioChainValid.load() && m_audioFrameProcessor.isReady()) {
                 std::vector<ProcessedAudioFrame> processedFrames;
                 QString errorMessage;
@@ -544,8 +552,8 @@ void VideoDecoder::decodeLoop()
         }
 
         if (packet->stream_index == videoStreamIndex) {
-            const bool sent = sendVideoPacket(packet);
-            av_packet_unref(packet);
+            const bool sent = sendVideoPacket(packet.get());
+            av_packet_unref(packet.get());
 
             if (!sent) {
                 if (fatalError || eofReached || abortDecode.load()) {
@@ -554,12 +562,12 @@ void VideoDecoder::decodeLoop()
                 continue;
             }
             bool seekTargetReached = false;
-            drainFrames(frame, &fatalError, &eofReached, &seekTargetReached);
+            drainFrames(frame.get(), &fatalError, &eofReached, &seekTargetReached);
             completePendingSeek(seekTargetReached);
         } 
         else if (audioStreamIndex >= 0 && packet->stream_index == audioStreamIndex && audioCodecCtx) {
-            const bool sent = sendAudioPacket(packet);
-            av_packet_unref(packet);
+            const bool sent = sendAudioPacket(packet.get());
+            av_packet_unref(packet.get());
 
             if (!sent) {
                 if (fatalError || eofReached || abortDecode.load()) {
@@ -567,10 +575,10 @@ void VideoDecoder::decodeLoop()
                 }
                 continue;
             }
-            drainAudioFrames(frame, &fatalError, &eofReached);
+            drainAudioFrames(frame.get(), &fatalError, &eofReached);
         }
         else {
-            av_packet_unref(packet);
+            av_packet_unref(packet.get());
         }
 
         if (fatalError) {
@@ -579,8 +587,6 @@ void VideoDecoder::decodeLoop()
     }
 
     applyVideoSkipPolicy(false);
-    av_frame_free(&frame);
-    av_packet_free(&packet);
     decoding.store(false);
     if (!fatalError && eofReached && !abortDecode.load()) {
         emit decodeFinished();

@@ -7,6 +7,7 @@
 #include <QObject>
 #include <QTimer>
 #include <deque>
+#include <memory>
 #include <mutex>
 
 #include "AudioOutputDevice.h"
@@ -78,8 +79,8 @@ private slots:
 private:
     VideoDecoder* m_decoder = nullptr;
     PreviewFrameLoader* m_previewLoader = nullptr;
-    QAudioSink* m_audioSink = nullptr;
-    AudioOutputDevice* m_audioOutput = nullptr;
+    std::unique_ptr<QAudioSink> m_audioSink;
+    std::unique_ptr<AudioOutputDevice> m_audioOutput;
     QTimer* m_renderTimer = nullptr;
     QTimer* m_previewTimer = nullptr;
     std::deque<RenderFrame> m_renderQueue;

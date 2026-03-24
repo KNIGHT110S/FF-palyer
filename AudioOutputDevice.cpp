@@ -3,8 +3,8 @@
 #include <algorithm>
 #include <cstring>
 
-AudioOutputDevice::AudioOutputDevice(const QAudioFormat& format, QObject* parent)
-    : QIODevice(parent)
+AudioOutputDevice::AudioOutputDevice(const QAudioFormat& format)
+    : QIODevice(nullptr)
 {
     setAudioFormat(format);
 }
