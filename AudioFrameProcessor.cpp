@@ -11,6 +11,59 @@ QString ffErr2Str(int err)
     return QString::fromUtf8(buf);
 }
 
+bool buildAbufferFilterArgs(const AVCodecContext* codecContext,
+                            AVRational timeBase,
+                            const AVChannelLayout& inputLayout,
+                            QByteArray* outArgs,
+                            QString* errorMessage)
+{
+    if (!codecContext || !outArgs) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio source filter arguments target is invalid.");
+        }
+        return false;
+    }
+
+    if (codecContext->sample_rate <= 0) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio sample rate is invalid for abuffer initialization.");
+        }
+        return false;
+    }
+
+    const char* sampleFormatName = av_get_sample_fmt_name(codecContext->sample_fmt);
+    if (!sampleFormatName) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio sample format is invalid for abuffer initialization.");
+        }
+        return false;
+    }
+
+    char channelLayoutDesc[128] = {0};
+    const int layoutRet = av_channel_layout_describe(&inputLayout,
+                                                     channelLayoutDesc,
+                                                     sizeof(channelLayoutDesc));
+    if (layoutRet < 0 || channelLayoutDesc[0] == '\0') {
+        if (errorMessage) {
+            *errorMessage = layoutRet < 0
+                ? QStringLiteral("Failed to describe audio channel layout: %1").arg(ffErr2Str(layoutRet))
+                : QStringLiteral("Audio channel layout description is empty.");
+        }
+        return false;
+    }
+
+    const AVRational safeTimeBase =
+        (timeBase.num > 0 && timeBase.den > 0) ? timeBase : AVRational{1, codecContext->sample_rate};
+
+    *outArgs =
+        QByteArray("time_base=") + QByteArray::number(safeTimeBase.num) +
+        "/" + QByteArray::number(safeTimeBase.den) +
+        ":sample_rate=" + QByteArray::number(codecContext->sample_rate) +
+        ":sample_fmt=" + QByteArray(sampleFormatName) +
+        ":channel_layout=" + QByteArray(channelLayoutDesc);
+    return true;
+}
+
 bool resolveUsableChannelLayout(const AVChannelLayout& source,
                                 int fallbackChannels,
                                 AVChannelLayout* outLayout,
@@ -193,9 +246,11 @@ bool AudioFrameProcessor::processDecodedFrame(AVFrame* frame,
 
     if (!m_filterEnabled) {
         std::vector<uint8_t> pcmData;
-        if (!resampleAudioFrame(frame, pcmData)) {
+        if (!resampleAudioFrame(frame, pcmData, errorMessage)) {
             if (errorMessage) {
-                *errorMessage = QStringLiteral("Audio resampling failed.");
+                if (errorMessage->isEmpty()) {
+                    *errorMessage = QStringLiteral("Audio resampling failed.");
+                }
             }
             return false;
         }
@@ -251,6 +306,12 @@ void AudioFrameProcessor::reset()
         swr_free(&m_swrContext);
         m_swrContext = nullptr;
     }
+    if (m_hasSwrInputConfig) {
+        av_channel_layout_uninit(&m_swrInputLayout);
+        m_hasSwrInputConfig = false;
+    }
+    m_swrInputSampleRate = 0;
+    m_swrInputSampleFormat = AV_SAMPLE_FMT_NONE;
 
     releaseAudioFilterGraph();
 }
@@ -274,6 +335,38 @@ bool AudioFrameProcessor::initSwrContext(AVCodecContext* codecContext, QString* 
         return false;
     }
 
+    const bool initialized = initSwrContextForInput(inputLayout,
+                                                    codecContext->sample_fmt,
+                                                    codecContext->sample_rate,
+                                                    errorMessage);
+    av_channel_layout_uninit(&inputLayout);
+    return initialized;
+}
+
+bool AudioFrameProcessor::initSwrContextForInput(const AVChannelLayout& inputLayout,
+                                                 AVSampleFormat inputSampleFormat,
+                                                 int inputSampleRate,
+                                                 QString* errorMessage)
+{
+    if (inputSampleRate <= 0) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio input sample rate is invalid while initializing resampler.");
+        }
+        return false;
+    }
+
+    if (inputSampleFormat == AV_SAMPLE_FMT_NONE) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio input sample format is invalid while initializing resampler.");
+        }
+        return false;
+    }
+
+    if (m_swrContext) {
+        swr_free(&m_swrContext);
+        m_swrContext = nullptr;
+    }
+
     AVChannelLayout outputLayout{};
     av_channel_layout_default(&outputLayout, m_outputChannels > 0 ? m_outputChannels : 2);
     const int ret = swr_alloc_set_opts2(&m_swrContext,
@@ -281,12 +374,11 @@ bool AudioFrameProcessor::initSwrContext(AVCodecContext* codecContext, QString* 
                                         m_outputSampleFormat,
                                         m_outputSampleRate,
                                         &inputLayout,
-                                        codecContext->sample_fmt,
-                                        codecContext->sample_rate,
+                                        inputSampleFormat,
+                                        inputSampleRate,
                                         0,
                                         nullptr);
     av_channel_layout_uninit(&outputLayout);
-    av_channel_layout_uninit(&inputLayout);
     if (ret < 0 || !m_swrContext) {
         if (errorMessage) {
             *errorMessage = ret < 0
@@ -304,7 +396,64 @@ bool AudioFrameProcessor::initSwrContext(AVCodecContext* codecContext, QString* 
         return false;
     }
 
+    if (m_hasSwrInputConfig) {
+        av_channel_layout_uninit(&m_swrInputLayout);
+        m_hasSwrInputConfig = false;
+    }
+    const int layoutCopyRet = av_channel_layout_copy(&m_swrInputLayout, &inputLayout);
+    if (layoutCopyRet < 0) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Failed to store audio resampler input layout: %1")
+                                .arg(ffErr2Str(layoutCopyRet));
+        }
+        swr_free(&m_swrContext);
+        return false;
+    }
+
+    m_swrInputSampleRate = inputSampleRate;
+    m_swrInputSampleFormat = inputSampleFormat;
+    m_hasSwrInputConfig = true;
+
     return true;
+}
+
+bool AudioFrameProcessor::ensureSwrContextForFrame(const AVFrame* frame, QString* errorMessage)
+{
+    if (!frame) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("Audio frame is invalid while checking resampler state.");
+        }
+        return false;
+    }
+
+    const int inputSampleRate = frame->sample_rate;
+    const AVSampleFormat inputSampleFormat = static_cast<AVSampleFormat>(frame->format);
+    AVChannelLayout inputLayout{};
+    const int fallbackChannels = m_hasSwrInputConfig
+        ? m_swrInputLayout.nb_channels
+        : 2;
+    if (!resolveUsableChannelLayout(frame->ch_layout, fallbackChannels, &inputLayout, errorMessage)) {
+        return false;
+    }
+
+    const bool needsReinit =
+        !m_swrContext ||
+        !m_hasSwrInputConfig ||
+        m_swrInputSampleRate != inputSampleRate ||
+        m_swrInputSampleFormat != inputSampleFormat ||
+        av_channel_layout_compare(&m_swrInputLayout, &inputLayout) != 0;
+
+    if (!needsReinit) {
+        av_channel_layout_uninit(&inputLayout);
+        return true;
+    }
+
+    const bool initialized = initSwrContextForInput(inputLayout,
+                                                    inputSampleFormat,
+                                                    inputSampleRate,
+                                                    errorMessage);
+    av_channel_layout_uninit(&inputLayout);
+    return initialized;
 }
 
 bool AudioFrameProcessor::shouldUseAudioFilter(double playbackSpeed) const
@@ -357,13 +506,19 @@ bool AudioFrameProcessor::initAudioFilterGraph(AVCodecContext* codecContext,
         return false;
     }
 
-    const AVRational safeTimeBase =
-        (timeBase.num > 0 && timeBase.den > 0) ? timeBase : AVRational{1, codecContext->sample_rate};
+    QByteArray abufferArgs;
+    if (!buildAbufferFilterArgs(codecContext, timeBase, inputLayout, &abufferArgs, errorMessage)) {
+        av_channel_layout_uninit(&inputLayout);
+        releaseAudioFilterGraph();
+        return false;
+    }
+
     ret = avfilter_graph_create_filter(&m_audioBufferSrcContext, abuffer, "audio_in",
-                                       nullptr, nullptr, m_audioFilterGraph);
+                                       abufferArgs.constData(), nullptr, m_audioFilterGraph);
     if (ret < 0) {
         if (errorMessage) {
-            *errorMessage = QStringLiteral("Failed to create abuffer source filter: %1")
+            *errorMessage = QStringLiteral("Failed to create abuffer source filter (%1): %2")
+                                .arg(QString::fromUtf8(abufferArgs))
                                 .arg(ffErr2Str(ret));
         }
         av_channel_layout_uninit(&inputLayout);
@@ -371,43 +526,7 @@ bool AudioFrameProcessor::initAudioFilterGraph(AVCodecContext* codecContext,
         return false;
     }
 
-    AVBufferSrcParameters* bufferParams = av_buffersrc_parameters_alloc();
-    if (!bufferParams) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Failed to allocate abuffer source parameters.");
-        }
-        av_channel_layout_uninit(&inputLayout);
-        releaseAudioFilterGraph();
-        return false;
-    }
-
-    bufferParams->format = codecContext->sample_fmt;
-    bufferParams->sample_rate = codecContext->sample_rate;
-    bufferParams->time_base = safeTimeBase;
-    ret = av_channel_layout_copy(&bufferParams->ch_layout, &inputLayout);
-    if (ret < 0) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Failed to copy abuffer channel layout: %1")
-                                .arg(ffErr2Str(ret));
-        }
-        av_free(bufferParams);
-        av_channel_layout_uninit(&inputLayout);
-        releaseAudioFilterGraph();
-        return false;
-    }
-
-    ret = av_buffersrc_parameters_set(m_audioBufferSrcContext, bufferParams);
-    av_channel_layout_uninit(&bufferParams->ch_layout);
-    av_free(bufferParams);
     av_channel_layout_uninit(&inputLayout);
-    if (ret < 0) {
-        if (errorMessage) {
-            *errorMessage = QStringLiteral("Failed to configure abuffer source filter: %1")
-                                .arg(ffErr2Str(ret));
-        }
-        releaseAudioFilterGraph();
-        return false;
-    }
 
     const QByteArray tempoArgs =
         QByteArray("tempo=") + QByteArray::number(playbackSpeed, 'f', 3);
@@ -461,9 +580,15 @@ bool AudioFrameProcessor::initAudioFilterGraph(AVCodecContext* codecContext,
     return true;
 }
 
-bool AudioFrameProcessor::resampleAudioFrame(const AVFrame* frame, std::vector<uint8_t>& outPcm) const
+bool AudioFrameProcessor::resampleAudioFrame(const AVFrame* frame,
+                                             std::vector<uint8_t>& outPcm,
+                                             QString* errorMessage)
 {
-    if (!m_swrContext || !frame || frame->nb_samples <= 0 || !frame->extended_data) {
+    if (!frame || frame->nb_samples <= 0 || !frame->extended_data) {
+        return false;
+    }
+
+    if (!ensureSwrContextForFrame(frame, errorMessage)) {
         return false;
     }
 
@@ -528,12 +653,16 @@ bool AudioFrameProcessor::drainFilteredAudioFrames(std::vector<ProcessedAudioFra
         const int ret = av_buffersink_get_frame(m_audioBufferSinkContext, filteredFrame);
         if (ret == 0) {
             std::vector<uint8_t> pcmData;
-            if (resampleAudioFrame(filteredFrame, pcmData)) {
+            if (resampleAudioFrame(filteredFrame, pcmData, errorMessage)) {
                 double ptsSec = filteredAudioPtsToSec(filteredFrame);
                 if (ptsSec <= 0.0) {
                     ptsSec = fallbackPtsSec;
                 }
                 outFrames->push_back({std::move(pcmData), ptsSec});
+            } else {
+                success = false;
+                av_frame_unref(filteredFrame);
+                break;
             }
             av_frame_unref(filteredFrame);
             continue;

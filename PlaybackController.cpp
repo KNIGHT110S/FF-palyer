@@ -277,12 +277,8 @@ void PlaybackController::setPlaybackRate(double rate)
         m_audioOutput->clear();
     }
     resetRenderClockCorrection();
-    if (m_audioSink && m_audioOutput) {
-        m_audioSink->reset();
-        m_audioSink->start(m_audioOutput.get());
-        if (!m_clockRunning) {
-            m_audioSink->suspend();
-        }
+    if (m_audioSink && !m_clockRunning) {
+        m_audioSink->suspend();
     }
 
     emit statusMessageChanged(QStringLiteral("Playback speed: %1x").arg(rate));

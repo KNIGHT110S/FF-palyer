@@ -48,11 +48,18 @@ public:
 private:
     bool shouldUseAudioFilter(double playbackSpeed) const;
     bool initSwrContext(AVCodecContext* codecContext, QString* errorMessage);
+    bool initSwrContextForInput(const AVChannelLayout& inputLayout,
+                                AVSampleFormat inputSampleFormat,
+                                int inputSampleRate,
+                                QString* errorMessage);
+    bool ensureSwrContextForFrame(const AVFrame* frame, QString* errorMessage);
     bool initAudioFilterGraph(AVCodecContext* codecContext,
                               AVRational timeBase,
                               double playbackSpeed,
                               QString* errorMessage);
-    bool resampleAudioFrame(const AVFrame* frame, std::vector<uint8_t>& outPcm) const;
+    bool resampleAudioFrame(const AVFrame* frame,
+                            std::vector<uint8_t>& outPcm,
+                            QString* errorMessage);
     bool drainFilteredAudioFrames(std::vector<ProcessedAudioFrame>* outFrames,
                                   double fallbackPtsSec,
                                   QString* errorMessage);
@@ -67,6 +74,10 @@ private:
     AVFilterContext* m_audioBufferSrcContext = nullptr;
     AVFilterContext* m_audioTempoContext = nullptr;
     AVFilterContext* m_audioBufferSinkContext = nullptr;
+    AVChannelLayout m_swrInputLayout {};
+    int m_swrInputSampleRate = 0;
+    AVSampleFormat m_swrInputSampleFormat = AV_SAMPLE_FMT_NONE;
+    bool m_hasSwrInputConfig = false;
     bool m_filterEnabled = false;
 };
 
